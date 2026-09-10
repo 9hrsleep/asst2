@@ -2,7 +2,7 @@
 
 # Assignment 2
 
-This is the starter code for Assignment 2 of CMU class 15-418/618, Spring 2026
+This is the starter code for Assignment 2 of CMU class 15-418/618, Fall 2026
 
 Please review the course's policy on [academic
 integrity](http://www.cs.cmu.edu/~418/academicintegrity.html),
