@@ -29,6 +29,21 @@ static inline int nextPow2(int n)
     return n;
 }
 
+__global__ void exclusive_scan_upsweep_kernel(int* device_data, int twod, int twod1, int length) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < length)
+       device_data[i+twod1-1] += device_data[i+twod-1];
+}
+
+__global__ void exclusive_scan_downsweep_kernel(int* device_data, int twod, int twod1, int length) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < length)
+        int t = device_data[i+twod-1];
+        device_data[i+twod-1] = device_data[i+twod1-1];
+        // change twod1 below to twod to reverse prefix sum.
+        device_data[i+twod1-1] += t;
+}
+
 void exclusive_scan(int* device_data, int length)
 {
     /* TODO
@@ -43,6 +58,26 @@ void exclusive_scan(int* device_data, int length)
      * both the data array is sized to accommodate the next
      * power of 2 larger than the input.
      */
+    
+    // our implementation with cuda
+    int threadsPerBlock = 512;
+    int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+
+    // upsweep phase
+    for (int twod = 1; twod < length; twod *= 2){
+        int twod1 = twod * 2;
+        // launch the parallel kernels
+        exclusive_scan_upsweep_kernel<<<blocks, threadsPerBlock>>>(device_data, twod, twod1, length);
+    }
+
+    device_data[length-1] = 0;
+    
+    // downsweep phase
+    for (int twod = length / 2; twod >= 1; twod /= 2){
+        int twod1 = twod * 2;
+        // launch the parallel kernels
+        exclusive_scan_upsweep_kernel<<<blocks, threadsPerBlock>>>(device_data, twod, twod1, length);
+    }
 }
 
 /* This function is a wrapper around the code you will write - it copies the
@@ -109,6 +144,16 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void flag_peaks_kernel(int* device_input, int *flags_of_peaks) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i == 0 || i == length - 1){
+        flags_of_peaks[i] = 0;
+        return;
+    }
+    flags_of_peaks[i] = (device_input[i] > device_input[i-1] && 
+                        device_input[i] > device_input[i+1]) ? 1 : 0;
+}
+
 
 int find_peaks(int *device_input, int length, int *device_output) {
     /* TODO:
@@ -125,6 +170,29 @@ int find_peaks(int *device_input, int length, int *device_output) {
      * it requires that. However, you must ensure that the results of
      * find_peaks are correct given the original length.
      */
+
+    int threadsPerBlock = 512;
+    int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+
+    // first flag the peaks
+    // assign chunks of device_input to different threads to find peaks in parallel
+    
+    int* flags_of_peaks; 
+    cudaMalloc(&flags_of_peaks, length*sizeof(int));
+    // TO ASK : do we need to memcpy for every kernel call like in saxby example
+    flag_peaks_kernel<<<blocks, threadsPerBlock>>>(device_input, flags_of_peaks);
+
+    // then do exclusive scan on the flag array to get indices of peaks
+    exclusive_scan(flags_of_peaks, length);
+
+    // then put the peaks into the output array
+    for (int i = 0; i < length; i++) {
+        if (flags_of_peaks[i]) {
+            int peak_index = device_output[i];
+            device_output[peak_index] = i;
+        }
+    }
+    cudaFree(flags_of_peaks);
     return 0;
 }
 
