@@ -29,19 +29,23 @@ static inline int nextPow2(int n)
     return n;
 }
 
-__global__ void exclusive_scan_upsweep_kernel(int* device_data, int twod, int twod1, int length) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < length)
-       device_data[i+twod1-1] += device_data[i+twod-1];
+__global__ void exclusive_scan_upsweep_kernel(int* device_data, int twod, int twod1, int treeLength) {
+    int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+    int start_index = thread_index * twod1;
+    int end_index = start_index + twod1 - 1;
+    if (end_index < treeLength) // check end bounds of block
+       device_data[start_index+twod1-1] += device_data[start_index+twod-1];
 }
 
-__global__ void exclusive_scan_downsweep_kernel(int* device_data, int twod, int twod1, int length) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < length)
-        int t = device_data[i+twod-1];
-        device_data[i+twod-1] = device_data[i+twod1-1];
-        // change twod1 below to twod to reverse prefix sum.
-        device_data[i+twod1-1] += t;
+__global__ void exclusive_scan_downsweep_kernel(int* device_data, int twod, int twod1, int treeLength) {
+    int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+    int start_index = thread_index * twod1;
+    int end_index = start_index + twod1 - 1;
+    if (end_index < treeLength) {
+        int t = device_data[start_index+twod-1];
+        device_data[start_index+twod-1] = device_data[start_index+twod1-1];
+        device_data[start_index+twod1-1] += t;
+    }
 }
 
 void exclusive_scan(int* device_data, int length)
@@ -61,22 +65,28 @@ void exclusive_scan(int* device_data, int length)
     
     // our implementation with cuda
     int threadsPerBlock = 512;
-    int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+    int treeLength = nextPow2(length);
 
     // upsweep phase
-    for (int twod = 1; twod < length; twod *= 2){
+    for (int twod = 1; twod < treeLength; twod *= 2){
         int twod1 = twod * 2;
+        int numThreads = treeLength / twod1; // the chunks of the tree
+        int blocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
         // launch the parallel kernels
-        exclusive_scan_upsweep_kernel<<<blocks, threadsPerBlock>>>(device_data, twod, twod1, length);
+        exclusive_scan_upsweep_kernel<<<blocks, threadsPerBlock>>>(device_data, twod, twod1, treeLength);
     }
 
-    device_data[length-1] = 0;
+    int zero = 0;
+    // write last elem of the array to be 0 
+    cudaMemcpy(device_data + treeLength - 1, &zero, sizeof(int), cudaMemcpyHostToDevice);
     
     // downsweep phase
-    for (int twod = length / 2; twod >= 1; twod /= 2){
+    for (int twod = treeLength / 2; twod >= 1; twod /= 2){
         int twod1 = twod * 2;
+        int numThreads = treeLength / twod1; // the chunks of the tree
+        int blocks = (numThreads + threadsPerBlock - 1) / threadsPerBlock;
         // launch the parallel kernels
-        exclusive_scan_upsweep_kernel<<<blocks, threadsPerBlock>>>(device_data, twod, twod1, length);
+        exclusive_scan_downsweep_kernel<<<blocks, threadsPerBlock>>>(device_data, twod, twod1, treeLength);
     }
 }
 
@@ -144,16 +154,31 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
-__global__ void flag_peaks_kernel(int* device_input, int *flags_of_peaks) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i == 0 || i == length - 1){
-        flags_of_peaks[i] = 0;
+__global__ void flag_peaks_kernel(int* device_input, int *flags_of_peaks, int length, int treeLength) {
+    int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+    // since more blocks than needed treeLength spawn, don't do anything with extra threads
+    if (thread_index >= treeLength) {
         return;
     }
-    flags_of_peaks[i] = (device_input[i] > device_input[i-1] && 
-                        device_input[i] > device_input[i+1]) ? 1 : 0;
+    if (thread_index == 0 || thread_index >= length - 1){
+        flags_of_peaks[thread_index] = 0;
+        return;
+    }
+    flags_of_peaks[thread_index] = (device_input[thread_index] > device_input[thread_index-1] && 
+                        device_input[thread_index] > device_input[thread_index+1]) ? 1 : 0;
 }
 
+__global__ void return_peak_indexes_kernel(int* device_output, int *flags_of_peaks, int length) {
+    int thread_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (thread_index == 0 || thread_index >= length - 1){
+        return;
+    }
+    if(flags_of_peaks[thread_index+1] != flags_of_peaks[thread_index]){
+        int peak_index = flags_of_peaks[thread_index];
+        device_output[peak_index] = thread_index;
+    }
+
+}
 
 int find_peaks(int *device_input, int length, int *device_output) {
     /* TODO:
@@ -173,27 +198,26 @@ int find_peaks(int *device_input, int length, int *device_output) {
 
     int threadsPerBlock = 512;
     int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+    int treeLength = nextPow2(length);
 
-    // first flag the peaks
-    // assign chunks of device_input to different threads to find peaks in parallel
-    
+    // flag the peaks in new array with peak indexs with value 1     
     int* flags_of_peaks; 
     cudaMalloc(&flags_of_peaks, length*sizeof(int));
-    // TO ASK : do we need to memcpy for every kernel call like in saxby example
-    flag_peaks_kernel<<<blocks, threadsPerBlock>>>(device_input, flags_of_peaks);
-
+    // assign chunks of device_input to different threads to find peaks in parallel
+    int flagBlocks = (treeLength + threadsPerBlock - 1) / threadsPerBlock;
+    flag_peaks_kernel<<<flagBlocks, threadsPerBlock>>>(device_input, flags_of_peaks, length, treeLength);
     // then do exclusive scan on the flag array to get indices of peaks
     exclusive_scan(flags_of_peaks, length);
 
-    // then put the peaks into the output array
-    for (int i = 0; i < length; i++) {
-        if (flags_of_peaks[i]) {
-            int peak_index = device_output[i];
-            device_output[peak_index] = i;
-        }
-    }
+    // collect peaks into the output array
+    return_peak_indexes_kernel<<<blocks, threadsPerBlock>>>(device_output, flags_of_peaks, length);
+    int numPeaksFound = 0;
+    // the highest peak found is put into the flags_of_peaks last index
+    cudaMemcpy(&numPeaksFound, flags_of_peaks+length-1, sizeof(int), cudaMemcpyDeviceToHost);
+    // wait for all threads to complete
+    cudaDeviceSynchronize();
     cudaFree(flags_of_peaks);
-    return 0;
+    return numPeaksFound;
 }
 
 
