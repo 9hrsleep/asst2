@@ -370,7 +370,11 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
     float oneMinusAlpha = 1.f - alpha;
 
     // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
+    
+    // atomicUpdateColor(&imagePtr->x, alpha, rgb.x, oneMinusAlpha);
+    // atomicUpdateColor(&imagePtr->y, alpha, rgb.y, oneMinusAlpha);
+    // atomicUpdateColor(&imagePtr->z, alpha, rgb.z, oneMinusAlpha);
+    // atomicAdd(&imagePtr->w, alpha);
 
     float4 existingColor = *imagePtr;
     float4 newColor;
@@ -378,9 +382,8 @@ shadePixel(float2 pixelCenter, float3 p, float4* imagePtr, int circleIndex) {
     newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
     newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
     newColor.w = alpha + existingColor.w;
-
-    // Global memory write
     *imagePtr = newColor;
+
 
     // END SHOULD-BE-ATOMIC REGION
 }
@@ -432,6 +435,33 @@ __global__ void kernelRenderCircles() {
         }
     }
 }
+
+// Each thread renders a pixel (for the ordering fix) 
+__global__ void kernelRenderPixels() {
+    int imageX = blockIdx.x * blockDim.x + threadIdx.x; 
+    int imageY = blockIdx.y * blockDim.y + threadIdx.y; 
+
+    int width = cuConstRendererParams.imageWidth;
+    int height = cuConstRendererParams.imageHeight;
+
+    if (imageX >= width || imageY >= height)
+        return;
+
+    float invWidth = 1.f / width;
+    float invHeight = 1.f / height;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(imageX) + 0.5f),
+                                        invHeight * (static_cast<float>(imageY) + 0.5f));
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (imageY * width + imageX)]);
+    float4 pixelColor = *imgPtr;
+
+    // For all circles in pixel
+    for (int i = 0; i < cuConstRendererParams.numberOfCircles; i++) {
+        // in the numberOfCircles array, we use the 3d array for 3 floats per circle hence i*3
+        float3 center = *(float3*)(&cuConstRendererParams.position[i*3]);
+        shadePixel(pixelCenterNorm, center, &pixelColor, i);
+    }
+    *imgPtr = pixelColor;
+}  
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
@@ -654,9 +684,14 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
+    // dim3 blockDim(256, 1);
+    // dim3 gridDim((numberOfCircles + blockDim.x - 1) / blockDim.x);
 
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+    dim3 blockDim(16, 16, 1);
+    dim3 gridDim(
+        (image->width + blockDim.x - 1) / blockDim.x,
+        (image->height + blockDim.y - 1) / blockDim.y);
+
+    kernelRenderPixels<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
 }
