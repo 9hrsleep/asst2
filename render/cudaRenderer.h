@@ -7,6 +7,10 @@
 
 #include "circleRenderer.h"
 
+#define BLOCKSIZE 256
+#define SCAN_BLOCK_DIM BLOCKSIZE
+#include "exclusiveScan.cu_inl"
+#include "circleBoxTest.cu_inl"
 
 class CudaRenderer : public CircleRenderer {
 
