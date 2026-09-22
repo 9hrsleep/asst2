@@ -420,56 +420,12 @@ shadePixel(float2 pixelCenter, float4 circle, float4* imagePtr, float3 circleCol
     // END SHOULD-BE-ATOMIC REGION
 }
 
-// // kernelRenderCircles -- (CUDA device code)
-// //
-// // Each thread renders a circle.  Since there is no protection to
-// // ensure order of update or mutual exclusion on the output image, the
-// // resulting image will be incorrect.
-// __global__ void kernelRenderCircles() {
-
-//     int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-//     if (index >= cuConstRendererParams.numberOfCircles)
-//         return;
-
-//     int index3 = 3 * index;
-
-//     // Read position and radius
-//     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-//     float  rad = cuConstRendererParams.radius[index];
-
-//     // Compute the bounding box of the circle. The bound is in integer
-//     // screen coordinates, so it's clamped to the edges of the screen.
-//     short imageWidth = cuConstRendererParams.imageWidth;
-//     short imageHeight = cuConstRendererParams.imageHeight;
-//     short minX = static_cast<short>(imageWidth * (p.x - rad));
-//     short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-//     short minY = static_cast<short>(imageHeight * (p.y - rad));
-//     short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-//     // A bunch of clamps.  Is there a CUDA built-in for this?
-//     short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-//     short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-//     short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-//     short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-//     float invWidth = 1.f / imageWidth;
-//     float invHeight = 1.f / imageHeight;
-
-//     // For all pixels in the bounding box
-//     for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-//         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-//         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-//             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-//                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
-//             shadePixel(pixelCenterNorm, circles, imgPtr, index);
-//             imgPtr++;
-//         }
-//     }
-// }
-
-// Each thread handles one circle by figuring out which squares this circle is inside
-__global__ void kernelPickSquaresThatCircleTouches(unsigned int* kernelCircleInSquareBitMasks, float4* kernelCircleData, int kernelNumSquaresX, 
+// kernelPickSquaresThatCircleTouches -- (CUDA device code)
+// Each thread is responsible for one circle. The thread will figure out which squares 
+// the circle touches and set the bit for this circle in the bit mask array for each square 
+// it touches.
+__global__ void kernelPickSquaresThatCircleTouches(unsigned int* kernelCircleInSquareBitMasks, 
+                                                   float4* kernelCircleData, int kernelNumSquaresX, 
                                                    int kernelNumSquaresY, int kernelNumMaskWords){
 
     int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -536,14 +492,13 @@ __global__ void kernelPickSquaresThatCircleTouches(unsigned int* kernelCircleInS
 }
 
 
-/**  new function 
- after forming a bit array of all touching circles for each tile, use prefix sum to
- get indexes of circles and render the circles using information in circle
- data (already saved as shared var)
-*/
-__global__ void
-kernelRenderSquares(unsigned int* kernelCircleInSquareBitMasks, const float4* kernelCircleData,
-                    int kernelNumSquaresX, int kernelNumMaskWords, bool isSnowflakes) {
+// kernelRenderSquares -- (CUDA device code)
+// This kernel is responsible for rendering all the circles in a square. Each thread 
+// is responsible for one pixel in the square. The thread will figure out which circles 
+// are in the square and shade the pixel accordingly.
+__global__ void kernelRenderSquares(unsigned int* kernelCircleInSquareBitMasks, const float4* kernelCircleData,
+                                    int kernelNumSquaresX, int kernelNumMaskWords, bool isSnowflakes) {
+
     // variables for image bounds for current thread
     int imageX = blockIdx.x * SQUARE_SIZE + threadIdx.x; 
     int imageY = blockIdx.y * SQUARE_SIZE + threadIdx.y; 
@@ -560,12 +515,12 @@ kernelRenderSquares(unsigned int* kernelCircleInSquareBitMasks, const float4* ke
     float2 pixelCenterNorm;
     float4* imgPtr;
     float4 pixelColor;
+    bool loaded = false; 
     
     if (threadInImageBounds) {
         pixelCenterNorm = make_float2(invWidth * (static_cast<float>(imageX) + 0.5f),
                                             invHeight * (static_cast<float>(imageY) + 0.5f));
         imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (imageY * width + imageX)]);
-        pixelColor = *imgPtr;
     }
 
     // offsets the huge global array of all squares and their circle bit masks to 
@@ -573,7 +528,7 @@ kernelRenderSquares(unsigned int* kernelCircleInSquareBitMasks, const float4* ke
     unsigned int* currSquareBitMasks =(kernelCircleInSquareBitMasks + 
                         ((size_t)blockIdx.y * kernelNumSquaresX + blockIdx.x) * kernelNumMaskWords);
     
-    // Shared memory allocations
+    // shared memory allocations
     __shared__ float4 sharedCircleData[BLOCKSIZE];
     __shared__ float3 sharedCircleColors[BLOCKSIZE];
 
@@ -601,10 +556,10 @@ kernelRenderSquares(unsigned int* kernelCircleInSquareBitMasks, const float4* ke
         prefixSumInput[linearThreadIndex] = count;
         __syncthreads();
 
+        // exclusive scan to get the starting index for each thread's circles in the shared memory array
         sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, THREADS_PER_SQUARE);
         __syncthreads();
 
-        // CHECKKKKK
         int myListStartIndex = prefixSumOutput[linearThreadIndex];
 
         int currNumCirclesFound = prefixSumOutput[THREADS_PER_SQUARE - 1] + prefixSumInput[THREADS_PER_SQUARE - 1];
@@ -623,6 +578,10 @@ kernelRenderSquares(unsigned int* kernelCircleInSquareBitMasks, const float4* ke
             __syncthreads(); // ensure all circle data is loaded
 
             if (threadInImageBounds) {
+                if (!loaded) {
+                    pixelColor = *imgPtr;
+                    loaded = true;
+                }
                 // edge case for very last batch might be uneven number of circles
                 int numCirclesRender = min(BLOCKSIZE, currNumCirclesFound - j);
                 for (int k =0; k < numCirclesRender; k++) {
@@ -633,99 +592,11 @@ kernelRenderSquares(unsigned int* kernelCircleInSquareBitMasks, const float4* ke
         }
     }
     
-    if (threadInImageBounds) {
+    // store the pixel color back to memory
+    if (threadInImageBounds && loaded) {
         *imgPtr = pixelColor;
     }
 }
-
-
-// // new function to render pixel by pixel
-// // Each thread renders a pixel (for the ordering fix) 
-// __global__ void kernelRenderPixels() {
-//     int imageX = blockIdx.x * blockDim.x + threadIdx.x; 
-//     int imageY = blockIdx.y * blockDim.y + threadIdx.y; 
-
-//     int width = cuConstRendererParams.imageWidth;
-//     int height = cuConstRendererParams.imageHeight;
-//     float invWidth = 1.f / width;
-//     float invHeight = 1.f / height;
-
-//     // variables for box bounds for each block
-//     float leftBound = (blockIdx.x * blockDim.x) * invWidth;
-//     float rightBound = ((blockIdx.x + 1) * blockDim.x) * invWidth;
-//     float bottomBound = (blockIdx.y * blockDim.y) * invHeight;
-//     float topBound = ((blockIdx.y + 1) * blockDim.y) * invHeight;
-
-//     // to check whether this thread is doing real work within the image boundary
-//     bool threadInImageBounds = (!(imageX >= width || imageY >= height));
-
-//     float2 pixelCenterNorm;
-//     float4* imgPtr;
-//     float4 pixelColor;
-
-//     if (threadInImageBounds){
-//         pixelCenterNorm = make_float2(invWidth * (static_cast<float>(imageX) + 0.5f),
-//                                             invHeight * (static_cast<float>(imageY) + 0.5f));
-//         imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (imageY * width + imageX)]);
-//         pixelColor = *imgPtr;
-//     }
-     
-//     __shared__ int sharedCircleIndices[BLOCKSIZE];
-
-//     // flattened 2d coordinate into 1d
-//     int linearThreadIndex =  threadIdx.y * blockDim.y + threadIdx.x;
-
-//     // arrays needed for prefix sum logic
-//     __shared__ uint prefixSumInput[BLOCKSIZE];
-//     __shared__ uint prefixSumOutput[BLOCKSIZE];
-//     __shared__ uint prefixSumScratch[2 * BLOCKSIZE];
-
-//     // interleaved assigment of circles for each thread
-//     for (int i = 0; i < cuConstRendererParams.numberOfCircles; i+= BLOCKSIZE) {
-        
-//         int threadCircleIdx = i + linearThreadIndex;
-//         int circleInBlock = 0;
-
-//         // dividing the work for each thread to check if the circle is in the block
-//         if (threadCircleIdx < cuConstRendererParams.numberOfCircles) {
-//             float3 circleData = *(float3*)(&cuConstRendererParams.position[threadCircleIdx*3]);
-//             float circleRadius = cuConstRendererParams.radius[threadCircleIdx];
-
-//             circleInBlock = circleInBox(circleData.x, circleData.y, circleRadius, leftBound, rightBound, topBound, bottomBound);
-//         }
-
-//         // prefixSumInput is a shared memory array that stores whether the circle is in the block or not for each thread
-//         prefixSumInput[linearThreadIndex] = circleInBlock;
-//         __syncthreads();
-
-//         // do exclusive scan on shared memory to get the indices of the circles that are in the block
-//         sharedMemExclusiveScan(linearThreadIndex, prefixSumInput, prefixSumOutput, prefixSumScratch, BLOCKSIZE);
-//         __syncthreads();
-
-//         // if circle is in block store its index in sharedCircleIndices
-//         if (circleInBlock) {
-//             sharedCircleIndices[prefixSumOutput[linearThreadIndex]] = threadCircleIdx;
-//         }
-//         __syncthreads();
-
-//         // find the total number of circles in the block
-//         int totalCirclesInBlock = prefixSumOutput[BLOCKSIZE - 1] + prefixSumInput[BLOCKSIZE - 1];
-
-//         if (threadInImageBounds) {
-//             // loop through only the compacted circles
-//             for (int j = 0; j < totalCirclesInBlock; j++) {
-//                 int circleIdx = sharedCircleIndices[j];
-//                 float3 circleData = *(float3*)(&cuConstRendererParams.position[circleIdx*3]);
-//                 shadePixel(pixelCenterNorm, circleData, &pixelColor, circleIdx);
-//             }
-//         }
-//         __syncthreads();
-//     }
-//     // only assign color in threads in bounds working on the image
-//     if (threadInImageBounds) {
-//         *imgPtr = pixelColor;
-//     }
-// }  
 
 ////////////////////////////////////////////////////////////////////////////////////////
 
