@@ -7,10 +7,14 @@
 
 #include "circleRenderer.h"
 
+// for the prefix sum logic (optimization gave us 59/72)
 #define BLOCKSIZE 256
-#define SCAN_BLOCK_DIM BLOCKSIZE
 #include "exclusiveScan.cu_inl"
 #include "circleBoxTest.cu_inl"
+
+// for the checking what circles are in each image section optimization
+#define SQUARE_SIZE 16
+#define THREADS_PER_SQUARE 256
 
 class CudaRenderer : public CircleRenderer {
 
